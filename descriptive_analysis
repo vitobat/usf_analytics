@@ -1,0 +1,447 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import ast
+import logging
+
+# 1. Configure Logging
+logging.basicConfig(filename='parsing_errors.log', level=logging.ERROR,
+                    format='%(asctime)s %(levelname)s:%(message)s')
+
+# 2. Load the Dataset
+file_path = 'nouns_for_lda.csv'
+try:
+    data = pd.read_csv(file_path, low_memory=False)
+    print(f"Successfully loaded '{file_path}'. Total rows: {len(data)}")
+except FileNotFoundError:
+    print(f"File '{file_path}' not found. Please check the file path.")
+    exit(1)
+except Exception as e:
+    print(f"An error occurred while loading the file: {e}")
+    exit(1)
+
+# 3. Convert 'date' to datetime
+try:
+    data['date'] = pd.to_datetime(data['date'], format='%Y-%m-%dT%H:%M:%S', errors='coerce')
+    print("Date conversion successful.")
+except Exception as e:
+    print(f"Error parsing dates: {e}")
+    exit(1)
+
+# 4. Drop Rows with Invalid Dates
+initial_row_count = len(data)
+data = data.dropna(subset=['date'])
+dropped_rows = initial_row_count - len(data)
+if dropped_rows > 0:
+    print(f"Dropped {dropped_rows} rows due to invalid dates.")
+
+# 5. Build an 'august_year' Column
+#    If month >= 9 (September..Dec), august_year = date.year
+#    else (Jan..Aug), august_year = date.year - 1
+def compute_august_year(dt):
+    if dt.month >= 9:
+        return dt.year
+    else:
+        return dt.year - 1
+
+data['august_year'] = data['date'].apply(compute_august_year)
+
+# We can still keep 'month','day', etc. if you want them for monthly counts
+data['month'] = data['date'].dt.month
+data['day'] = data['date'].dt.day
+data['day_of_week'] = data['date'].dt.day_name()
+data['hour'] = data['date'].dt.hour
+
+# 6. Define an Enhanced Parsing Function for 'nouns_only'
+import ast
+
+def parse_nouns(x, index):
+    if pd.isna(x):
+        return ''
+    try:
+        nouns = ast.literal_eval(x)
+        if isinstance(nouns, list):
+            words = [entry['Word'] for entry in nouns if isinstance(entry, dict) and 'Word' in entry]
+            return ' '.join(words)
+        elif isinstance(nouns, str):
+            return nouns.strip()
+        else:
+            logging.error(f"Row {index}: Unexpected data type after parsing: {type(nouns)}")
+            return ''
+    except (ValueError, SyntaxError, TypeError):
+        try:
+            return x.strip()
+        except AttributeError:
+            logging.error(f"Row {index}: Failed to parse 'nouns_only' entry: {x}")
+            return ''
+
+data['nouns_text'] = data.apply(lambda row: parse_nouns(row['nouns_only'], row.name), axis=1)
+parsed_rows = data['nouns_text'].ne('').sum()
+total_rows = len(data)
+skipped_rows = total_rows - parsed_rows
+print(f"Parsed 'nouns_text' successfully for {parsed_rows} rows.")
+if skipped_rows > 0:
+    print(f"Skipped {skipped_rows} rows due to malformed 'nouns_only' entries. Check 'parsing_errors.log' for details.")
+
+if data.empty:
+    print("No valid data available after parsing. Exiting.")
+    exit(1)
+
+# 7. Helper Functions
+
+def total_messages(year_data):
+    return len(year_data)
+
+def monthly_distribution(year_data):
+    month_counts = (
+        year_data['month']
+        .value_counts()
+        .sort_index()
+        .reindex(range(1,13), fill_value=0)
+    )
+    return month_counts
+
+def daily_distribution(year_data):
+    messages_per_day = year_data.groupby(year_data['date'].dt.date).size()
+    avg_per_day = messages_per_day.mean()
+    messages_by_day = (
+        year_data['day_of_week']
+        .value_counts()
+        .reindex(
+            ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+            fill_value=0
+        )
+        .astype(int)
+    )
+    return avg_per_day, messages_by_day
+
+################################################
+#           BRAND NEW UNIQUE-USERS LOGIC       #
+################################################
+
+def user_stats(year_data, all_data, current_august_year):
+    """
+    Returns a tuple:
+      - total_unique: number of distinct from_id in current_august_year
+      - new_count: how many are brand-new (not in (current_august_year - 1))
+      - returning_count: how many re-appeared from the immediate previous august_year
+      - returning_percent: returning_count / total_unique * 100
+    """
+    current_users = set(year_data['from_id'].unique())
+    total_unique = len(current_users)
+
+    prev_august_year = current_august_year - 1
+
+    if prev_august_year < all_data['august_year'].min():
+        return total_unique, total_unique, 0, 0.0
+
+    prev_data = all_data[all_data['august_year'] == prev_august_year]
+    if prev_data.empty:
+        return total_unique, total_unique, 0, 0.0
+
+    prev_users = set(prev_data['from_id'].unique())
+
+    returning = current_users.intersection(prev_users)
+    returning_count = len(returning)
+    new_count = total_unique - returning_count
+
+    returning_percent = (returning_count / total_unique * 100) if total_unique else 0.0
+    return total_unique, new_count, returning_count, returning_percent
+
+################################################
+
+def peaks(year_data):
+    # Peak Month
+    peak_month_series = year_data['month'].value_counts()
+    peak_month_num = peak_month_series.idxmax()
+    peak_month_count = peak_month_series.max()
+
+    # Peak Day
+    peak_day_series = year_data['date'].dt.date.value_counts()
+    peak_day = peak_day_series.idxmax()
+    peak_day_count = peak_day_series.max()
+
+    # Peak Hour (change here for clarity)
+    hour_counts = year_data['hour'].value_counts()  
+    peak_hour = hour_counts.idxmax()
+    peak_hour_count = hour_counts.max()
+
+    # Convert month number to name
+    peak_month_name = datetime(1900, peak_month_num, 1).strftime('%B')
+
+    return peak_month_name, peak_month_count, peak_day, peak_day_count, peak_hour, peak_hour_count
+
+def top_contributors(year_data):
+    top_users = year_data['from_id'].value_counts().head(3)
+    total_unique_users = year_data['from_id'].nunique()
+    top_10_percent_count = max(1, int(np.ceil(total_unique_users * 0.10)))
+    top_10_percent_users = year_data['from_id'].value_counts().head(top_10_percent_count).sum()
+    total_messages_count = len(year_data)
+    top_10_percent_share = (top_10_percent_users / total_messages_count * 100) if total_messages_count else 0
+    return top_users, top_10_percent_share
+
+def power_law_analysis(year_data):
+    user_counts = year_data['from_id'].value_counts()
+    total_msg = len(year_data)
+
+    top_1_count = max(1, int(np.ceil(len(user_counts) * 0.01)))
+    top_5_count = max(1, int(np.ceil(len(user_counts) * 0.05)))
+    top_10_count = max(1, int(np.ceil(len(user_counts) * 0.10)))
+
+    top_1 = user_counts.head(top_1_count).sum()
+    top_5 = user_counts.head(top_5_count).sum()
+    top_10 = user_counts.head(top_10_count).sum()
+
+    return (
+        (top_1 / total_msg) * 100 if total_msg else 0,
+        (top_5 / total_msg) * 100 if total_msg else 0,
+        (top_10 / total_msg) * 100 if total_msg else 0
+    )
+
+def longest_reply_streak(year_data):
+    sorted_data = year_data.sort_values('date')
+    max_streak = 0
+    current_streak = 0
+    previous_id = None
+
+    for _, row in sorted_data.iterrows():
+        this_id = row['id']
+        reply_to_id = row.get('reply_to_message_id', np.nan)
+
+        if pd.notna(reply_to_id) and reply_to_id == previous_id:
+            current_streak += 1
+        else:
+            current_streak = 1 if pd.notna(reply_to_id) else 0
+
+        if current_streak > max_streak:
+            max_streak = current_streak
+
+        previous_id = this_id
+    return max_streak
+
+def inactive_users(aug_year, all_data):
+    previous_data = all_data[all_data['august_year'] < aug_year]
+    current_data = all_data[all_data['august_year'] == aug_year]
+
+    if previous_data.empty:
+        return 0
+
+    prev_users = set(previous_data['from_id'].unique())
+    curr_users = set(current_data['from_id'].unique())
+
+    return len(prev_users - curr_users)
+
+def top_contributor_consistency(aug_year, all_data, previous_topics):
+    prev_aug_year = aug_year - 1
+    if prev_aug_year < all_data['august_year'].min():
+        return 0.0
+
+    prev_top = set(
+        all_data[all_data['august_year'] == prev_aug_year]['from_id']
+        .value_counts().head(3).index
+    )
+    curr_top = set(
+        all_data[all_data['august_year'] == aug_year]['from_id']
+        .value_counts().head(3).index
+    )
+
+    if not prev_top:
+        return 0.0
+
+    return (len(prev_top.intersection(curr_top)) / len(prev_top)) * 100
+
+def most_discussed_topics(lda_data, previous_topics, num_topics=20, n_top_words=6):
+    if lda_data.empty:
+        return pd.Series(dtype=int), [], []
+
+    vectorizer = CountVectorizer(max_features=500)
+    X = vectorizer.fit_transform(lda_data['nouns_text'])
+
+    if X.shape[0] < 10:
+        return pd.Series(dtype=int), [], []
+
+    lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
+    try:
+        lda.fit(X)
+    except ValueError as e:
+        logging.error(f"LDA failed with error: {e}")
+        return pd.Series(dtype=int), [], []
+
+    topic_assignments = lda.transform(X).argmax(axis=1)
+    lda_data = lda_data.copy()
+    lda_data['topic'] = topic_assignments
+
+    feature_names = vectorizer.get_feature_names_out()
+    topic_keywords = {}
+    for topic_idx, topic_row in enumerate(lda.components_):
+        top_features_ind = topic_row.argsort()[:-n_top_words - 1:-1]
+        top_features = [feature_names[i] for i in top_features_ind]
+        topic_keywords[topic_idx] = top_features
+
+    def assign_topic_name(idx):
+        return f"Topic {idx + 1}: " + ", ".join(topic_keywords[idx])
+
+    lda_data['topic_name'] = lda_data['topic'].apply(assign_topic_name)
+    topic_counts = lda_data['topic_name'].value_counts().head(5)
+
+    current_topics = set(topic_counts.index)
+    emerging = list(current_topics - previous_topics)
+    declining = list(previous_topics - current_topics)
+
+    return topic_counts, emerging, declining
+
+def message_response_time(year_data):
+    id_date_map = year_data.set_index('id')['date'].to_dict()
+    replies = year_data.dropna(subset=['reply_to_message_id']).copy()
+    replies = replies[replies['reply_to_message_id'].isin(id_date_map)]
+
+    if replies.empty:
+        return 0.0, 0.0, 0.0
+
+    replies['original_date'] = replies['reply_to_message_id'].map(id_date_map)
+    replies['response_time'] = (replies['date'] - replies['original_date']).dt.total_seconds()
+    replies = replies[(replies['response_time'] >= 0) & (replies['response_time'] <= 86400)]
+
+    if replies['response_time'].empty:
+        return 0.0, 0.0, 0.0
+
+    avg_resp = replies['response_time'].mean()
+    shortest_resp = replies['response_time'].min()
+    longest_resp = replies['response_time'].max()
+    return avg_resp, shortest_resp, longest_resp
+
+# 8. Generate the Descriptive Analysis Report
+
+output_file = 'yearly_descriptive_analysis.txt'
+aug_years = sorted(data['august_year'].unique())
+all_topics = set()
+
+with open(output_file, 'w', encoding='utf-8') as f:
+    for aug_year in aug_years:
+        this_year_data = data[data['august_year'] == aug_year]
+
+        # If not earliest year, remove brand-new users from older approach
+        earliest_aug = data['august_year'].min()
+        if aug_year > earliest_aug:
+            older = data[data['august_year'] < aug_year]
+            older_users = set(older['from_id'].unique())
+            this_year_data = this_year_data[this_year_data['from_id'].isin(older_users)]
+
+        if this_year_data.empty:
+            f.write(f"### Year (Aug-to-Jul): {aug_year}\n\n")
+            f.write("No data available for this year.\n\n---\n\n")
+            continue
+
+        # 1) Core metrics
+        total_msgs = total_messages(this_year_data)
+        monthly_dist = monthly_distribution(this_year_data)
+        avg_per_day, daily_dist = daily_distribution(this_year_data)
+
+        (total_unique,
+         new_count,
+         returning_count,
+         returning_percent) = user_stats(this_year_data, data, aug_year)
+
+        (peak_month, peak_month_count,
+         peak_day, peak_day_count,
+         peak_hour, peak_hour_count) = peaks(this_year_data)
+
+        top_users, top_10_share = top_contributors(this_year_data)
+        top_1, top_5, top_10 = power_law_analysis(this_year_data)
+        avg_resp, shortest_resp, longest_resp = message_response_time(this_year_data)
+        longest_streak = longest_reply_streak(this_year_data)
+        inactive = inactive_users(aug_year, data)
+        consistency = top_contributor_consistency(aug_year, data, all_topics)
+
+        # 2) LDA only on messages with non-empty 'nouns_text'
+        lda_data = this_year_data[this_year_data['nouns_text'] != '']
+        top_topics, emerging_topics, declining_topics = most_discussed_topics(lda_data, all_topics)
+        all_topics.update(top_topics.index)
+
+        # 3) Write out
+        f.write(f"### Year (Aug-to-Jul): {aug_year}\n\n")
+
+        # 1. Total Messages
+        f.write(f"#### 1. Total Messages\n")
+        f.write(f"- Total number of messages: {total_msgs}\n\n")
+
+        # 2. Monthly Distribution
+        f.write(f"#### 2. Monthly Distribution\n")
+        f.write("```\n")
+        for month_num, count in monthly_dist.items():
+            month_name = datetime(1900, month_num, 1).strftime('%B')
+            f.write(f"{month_name}: {count}\n")
+        f.write("```\n\n")
+
+        # 3. Daily Distribution
+        f.write(f"#### 3. Daily Distribution\n")
+        f.write(f"- Average messages per day: {avg_per_day:.2f}\n")
+        f.write("```\n")
+        for day, count in daily_dist.items():
+            f.write(f"{day}: {count}\n")
+        f.write("```\n\n")
+
+        # 4. Unique Users
+        f.write(f"#### 4. Unique Users\n")
+        f.write(f"- Number of unique users: {total_unique}\n")
+        f.write(f"- Number of new users: {new_count}\n")
+        f.write(f"- Number of returning users: {returning_count}\n")
+        f.write(f"- Percentage of returning users: {returning_percent:.2f}%\n\n")
+
+        # 5. Peaks
+        f.write(f"#### 5. Peaks\n")
+        f.write(f"- Peak month: {peak_month} ({peak_month_count} messages)\n")
+        f.write(f"- Peak day: {peak_day} ({peak_day_count} messages)\n")
+        f.write(f"- Peak hour: {peak_hour}:00–{peak_hour}:59 ({peak_hour_count} messages)\n\n")
+
+        # 6. Top Contributors
+        f.write(f"#### 6. Top Contributors\n")
+        f.write("```\n")
+        for idx, (u, ccount) in enumerate(top_users.items(), 1):
+            f.write(f"{idx}. User ID: {u} - {ccount} messages\n")
+        f.write("```\n")
+        f.write(f"- Top 10% contributors' share of total messages: {top_10_share:.2f}%\n\n")
+
+        # 7. Power Law Analysis
+        f.write(f"#### 7. Power Law Analysis\n")
+        f.write(f"- Top 1% contributors' share: {top_1:.2f}%\n")
+        f.write(f"- Top 5% contributors' share: {top_5:.2f}%\n")
+        f.write(f"- Top 10% contributors' share: {top_10:.2f}%\n\n")
+
+        # 8. Topics
+        f.write(f"#### 8. Topics\n")
+        if not top_topics.empty:
+            f.write("```\n")
+            for topic, tcount in top_topics.items():
+                f.write(f"{topic}: {tcount} mentions\n")
+            f.write("```\n")
+        else:
+            f.write("No topics identified for this August-year.\n")
+        f.write(f"- Emerging topics: {emerging_topics}\n")
+        f.write(f"- Declining topics: {declining_topics}\n\n")
+
+        # 9. (Removed Contribution Lifespan)
+
+        # 10. Message Response Time
+        f.write(f"#### 10. Message Response Time\n")
+        f.write(f"- Average response time: {avg_resp:.2f} seconds\n")
+        f.write(f"- Shortest response time: {shortest_resp} seconds\n")
+        f.write(f"- Longest response time: {longest_resp} seconds\n\n")
+
+        # 11. Longest Reply Streak
+        f.write(f"#### 11. Longest Reply Streak\n")
+        f.write(f"- Longest continuous chain of replies: {longest_streak}\n\n")
+
+        # 12. Inactive Users
+        f.write(f"#### 12. Inactive Users\n")
+        f.write(f"- Number of users who stopped contributing after this year: {inactive}\n\n")
+
+        # 13. Top Contributor Consistency
+        f.write(f"#### 13. Top Contributor Consistency\n")
+        f.write(f"- Percentage of previous top contributors remaining in the current year: {consistency:.2f}%\n\n")
+
+        f.write("---\n\n")
+
+print(f"Descriptive analysis report generated in '{output_file}'")
