@@ -1,0 +1,29 @@
+Comprehensive analysis of a telegram group chat with requesting of comprehensive sentiment analysis
+
+
+Order 
+1. Cleaning
+2. Annotation & Emotion requesting
+3. Metrics
+4. Descriptive
+
+Text Extraction & Cleaning
+
+Extracts and cleans raw text data to prepare it for sentiment and emotion analysis.
+Stanza Annotation
+
+Annotates Ukrainian text using the Stanza NLP model to extract linguistic features (POS, Lemma, Dependency).
+Emotion & Sentiment Analysis
+
+Analyzes sentiment and emotion intensity using OpenAI's GPT model, generating a detailed JSON output for each text message.
+Metrics Calculation
+
+Computes user behavior metrics such as message count, reaction count, replies sent/received, and categorizes users into specific groups based on their engagement.
+Batch Processing
+
+Handles large datasets through batch processing and uploading to OpenAI's API for emotion analysis, with support for retries and error handling.
+Output & Reporting
+
+Saves processed data to CSV files, including sentiment scores, emotion metrics, and user behavior rankings.
+
+At the end you are gonna have a few txt files and datasets. 
